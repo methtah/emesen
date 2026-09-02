@@ -1,0 +1,16 @@
+{
+  "name": "emesen-relay",
+  "version": "1.0.0",
+  "description": "emesen — uçtan uca şifreli mesajlaşma için hafif WebSocket relay sunucusu (RAM-only, veritabanı yok)",
+  "main": "server.js",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
