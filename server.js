@@ -3,107 +3,131 @@
 /**
  * emesen — WebSocket relay sunucusu
  * -----------------------------------------------------------------
- * Bu sunucu HİÇBİR VERİYİ DİSKE YAZMAZ. Tüm state (kullanıcılar,
- * davet kodları, çevrimdışı mesaj kuyruğu) yalnızca process RAM'inde
- * (Map/Set) tutulur. Sunucu, mesajların şifreli (ciphertext) halini
- * görür; şifre çözme işlemi yalnızca istemcide (tarayıcıda) yapılır.
- * Sunucu yeniden başladığında (deploy, restart, crash) tüm state sıfırlanır.
+ * KİMLİK / HESAP KATMANI (kalıcı):
+ *   data-store.json dosyasında yalnızca şunlar tutulur:
+ *     - accounts: { id: { code, nickname, contacts:[id...], createdAt } }
+ *     - pendingInvites: { code: { createdBy, createdAt } }
+ *   Bu dosya sunucu çalışırken otomatik okunup yazılır — manuel commit
+ *   GEREKMEZ. Render her yeniden deploy edildiğinde sıfırlanır (ephemeral
+ *   disk); kalıcılığı garanti etmek istersen ileride harici bir DB'ye
+ *   taşınabilir.
+ *
+ * MESAJ KATMANI (RAM-only, hiç diske yazılmaz):
+ *   sessions ve offlineQueue yalnızca process belleğinde tutulur.
+ *   Sunucu şifreli (ciphertext) içerikten başka bir şey görmez.
  */
 
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 10000;
-const INVITE_CODE_TTL_MS = 60 * 1000;      // davet kodu 60 sn'de bir yenilenir
-const OFFLINE_MSG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // güvenlik supabı: 7 gün sonra RAM'den temizle
+const STORE_PATH = path.join(__dirname, 'data-store.json');
+const PENDING_INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000;   // kullanılmayan davet 7 günde düşer
+const OFFLINE_MSG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;  // güvenlik supabı
 
 // ---------------------------------------------------------------
-// In-memory state
+// Kalıcı hesap deposu
 // ---------------------------------------------------------------
-const clients = new Map();        // userId -> { ws, username, publicKey, contacts:Set<id>, inviteCode, inviteExpiresAt, inviteTimer }
-const inviteCodeIndex = new Map(); // code(string) -> userId
-const offlineQueue = new Map();    // userId -> Map(messageId -> {from, ciphertext, iv, ts})
-
-function genId() {
-  return crypto.randomBytes(9).toString('base64url');
+function loadStore() {
+  try {
+    const raw = fs.readFileSync(STORE_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    return {
+      accounts: data.accounts || {},
+      pendingInvites: data.pendingInvites || {}
+    };
+  } catch {
+    return { accounts: {}, pendingInvites: {} };
+  }
+}
+let store = loadStore();
+let saveScheduled = false;
+function saveStore() {
+  if (saveScheduled) return;
+  saveScheduled = true;
+  setImmediate(() => {
+    saveScheduled = false;
+    try {
+      const tmp = STORE_PATH + '.tmp';
+      fs.writeFileSync(tmp, JSON.stringify(store, null, 2));
+      fs.renameSync(tmp, STORE_PATH);
+    } catch (e) { console.error('store yazılamadı', e); }
+  });
 }
 
-function genInviteCode() {
+function codeToAccountId(code) {
+  for (const [id, acc] of Object.entries(store.accounts)) if (acc.code === code) return id;
+  return null;
+}
+function genId() { return crypto.randomBytes(9).toString('base64url'); }
+function genCode() {
   let code;
-  do {
-    code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
-  } while (inviteCodeIndex.has(code));
+  do { code = String(crypto.randomInt(0, 1000000)).padStart(6, '0'); }
+  while (store.pendingInvites[code] || codeToAccountId(code));
   return code;
 }
+function genNickname() {
+  const taken = new Set(Object.values(store.accounts).map(a => a.nickname));
+  let nick;
+  do { nick = 'emesen-' + String(crypto.randomInt(0, 100000)).padStart(5, '0'); }
+  while (taken.has(nick));
+  return nick;
+}
+
+// ---------------------------------------------------------------
+// Çalışma zamanı (RAM) state
+// ---------------------------------------------------------------
+const sessions = new Map();       // accountId -> { ws, publicKey }
+const offlineQueue = new Map();   // accountId -> Map(messageId -> {from, ciphertext, iv, ts})
 
 function send(ws, payload) {
   if (ws && ws.readyState === WebSocket.OPEN) {
-    try { ws.send(JSON.stringify(payload)); } catch (_) { /* bağlantı kapanmış olabilir */ }
+    try { ws.send(JSON.stringify(payload)); } catch (_) {}
   }
 }
-
+function isOnline(id) { const s = sessions.get(id); return !!(s && s.ws && s.ws.readyState === WebSocket.OPEN); }
 function publicUserInfo(id) {
-  const c = clients.get(id);
-  if (!c) return null;
-  return {
-    id,
-    username: c.username,
-    online: !!(c.ws && c.ws.readyState === WebSocket.OPEN),
-    publicKey: c.publicKey
-  };
+  const acc = store.accounts[id];
+  if (!acc) return null;
+  const s = sessions.get(id);
+  return { id, nickname: acc.nickname, online: isOnline(id), publicKey: s ? s.publicKey : null };
 }
-
 function contactListPayload(id) {
-  const c = clients.get(id);
-  if (!c) return [];
-  return [...c.contacts].map(publicUserInfo).filter(Boolean);
+  const acc = store.accounts[id];
+  if (!acc) return [];
+  return acc.contacts.map(publicUserInfo).filter(Boolean);
 }
-
 function broadcastPresence(id, online) {
-  const c = clients.get(id);
-  if (!c) return;
-  for (const contactId of c.contacts) {
-    const contact = clients.get(contactId);
-    if (contact) send(contact.ws, { type: 'presence', id, online });
+  const acc = store.accounts[id];
+  if (!acc) return;
+  for (const cid of acc.contacts) {
+    const s = sessions.get(cid);
+    if (s) send(s.ws, { type: 'presence', id, online });
   }
 }
-
-function rotateInviteCode(id) {
-  const c = clients.get(id);
-  if (!c) return;
-  if (c.inviteCode) inviteCodeIndex.delete(c.inviteCode);
-  const code = genInviteCode();
-  const expiresAt = Date.now() + INVITE_CODE_TTL_MS;
-  c.inviteCode = code;
-  c.inviteExpiresAt = expiresAt;
-  inviteCodeIndex.set(code, id);
-  send(c.ws, { type: 'invite_code', code, expiresAt });
-  clearTimeout(c.inviteTimer);
-  c.inviteTimer = setTimeout(() => rotateInviteCode(id), INVITE_CODE_TTL_MS);
-}
-
 function deliverQueued(id) {
   const q = offlineQueue.get(id);
-  const c = clients.get(id);
-  if (!q || !c) return;
+  const s = sessions.get(id);
+  if (!q || !s) return;
   for (const [msgId, m] of q) {
-    send(c.ws, { type: 'message', id: msgId, from: m.from, ciphertext: m.ciphertext, iv: m.iv, ts: m.ts });
+    send(s.ws, { type: 'message', id: msgId, from: m.from, ciphertext: m.ciphertext, iv: m.iv, ts: m.ts });
   }
 }
 
 // ---------------------------------------------------------------
-// HTTP + WebSocket sunucusu
+// HTTP + WebSocket
 // ---------------------------------------------------------------
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('emesen relay sunucusu calisiyor (RAM-only, disk yok)');
+  res.end(`emesen relay sunucusu calisiyor. Hesap sayisi: ${Object.keys(store.accounts).length}`);
 });
-
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws) => {
-  let userId = null;
+  let myId = null;
 
   ws.on('message', (raw) => {
     let msg;
@@ -111,101 +135,106 @@ wss.on('connection', (ws) => {
     if (!msg || typeof msg.type !== 'string') return;
 
     switch (msg.type) {
-      case 'register': {
-        if (typeof msg.username !== 'string' || !msg.username.trim() || typeof msg.publicKey !== 'object') {
-          return send(ws, { type: 'error', message: 'kullanıcı adı ve genel anahtar zorunlu' });
+      case 'login': {
+        const code = String(msg.code || '').trim();
+        const publicKey = msg.publicKey;
+        if (!/^\d{6}$/.test(code) || typeof publicKey !== 'object') {
+          return send(ws, { type: 'error', message: 'geçersiz kod veya anahtar' });
         }
-        userId = genId();
-        clients.set(userId, {
-          ws,
-          username: msg.username.trim().slice(0, 32),
-          publicKey: msg.publicKey,
-          contacts: new Set(),
-          inviteCode: null,
-          inviteExpiresAt: null,
-          inviteTimer: null
-        });
 
-        // Kayıt sırasında bir davet koduyla direkt katılım (opsiyonel)
-        if (typeof msg.inviteCode === 'string' && msg.inviteCode.trim()) {
-          const hostId = inviteCodeIndex.get(msg.inviteCode.trim());
-          const host = hostId ? clients.get(hostId) : null;
-          if (host && hostId !== userId) {
-            host.contacts.add(userId);
-            clients.get(userId).contacts.add(hostId);
-            send(host.ws, { type: 'contact_added', user: publicUserInfo(userId) });
-          } else {
-            send(ws, { type: 'error', message: 'davet kodu geçersiz veya süresi dolmuş' });
+        let accountId = codeToAccountId(code);
+
+        if (!accountId) {
+          const invite = store.pendingInvites[code];
+          const bootstrap = Object.keys(store.accounts).length === 0; // ilk hesap (kurucu)
+
+          if (!invite && !bootstrap) {
+            return send(ws, { type: 'error', message: 'geçersiz veya süresi dolmuş davet kodu' });
           }
+
+          // Kalıcı yeni hesap oluştur — bu kod artık BU hesabın kalıcı giriş anahtarı
+          accountId = genId();
+          store.accounts[accountId] = {
+            code,
+            nickname: genNickname(),
+            contacts: invite ? [invite.createdBy] : [],
+            createdAt: Date.now()
+          };
+          if (invite) {
+            const inviter = store.accounts[invite.createdBy];
+            if (inviter && !inviter.contacts.includes(accountId)) inviter.contacts.push(accountId);
+            delete store.pendingInvites[code];
+          }
+          saveStore();
         }
 
-        send(ws, { type: 'registered', id: userId, contacts: contactListPayload(userId) });
-        rotateInviteCode(userId);
-        deliverQueued(userId);
-        broadcastPresence(userId, true);
+        myId = accountId;
+        sessions.set(myId, { ws, publicKey });
+
+        send(ws, {
+          type: 'logged_in',
+          id: myId,
+          nickname: store.accounts[myId].nickname,
+          contacts: contactListPayload(myId)
+        });
+        deliverQueued(myId);
+        broadcastPresence(myId, true);
+
+        // İlk katılımda: davet edenin ekranına yeni kişiyi anında düş
+        for (const cid of store.accounts[myId].contacts) {
+          const s = sessions.get(cid);
+          if (s) send(s.ws, { type: 'contact_added', user: publicUserInfo(myId) });
+        }
         break;
       }
 
-      case 'use_invite_code': {
-        if (!userId) return;
-        const code = String(msg.code || '').trim();
-        const targetId = inviteCodeIndex.get(code);
-        const self = clients.get(userId);
-        if (!targetId || targetId === userId) {
-          return send(ws, { type: 'error', message: 'davet kodu geçersiz veya süresi dolmuş' });
-        }
-        const target = clients.get(targetId);
-        if (!target) return send(ws, { type: 'error', message: 'kullanıcı bulunamadı' });
-
-        self.contacts.add(targetId);
-        target.contacts.add(userId);
-        send(ws, { type: 'contact_added', user: publicUserInfo(targetId) });
-        send(target.ws, { type: 'contact_added', user: publicUserInfo(userId) });
+      case 'generate_invite': {
+        if (!myId) return;
+        const code = genCode();
+        store.pendingInvites[code] = { createdBy: myId, createdAt: Date.now() };
+        saveStore();
+        send(ws, { type: 'invite_created', code });
         break;
       }
 
       case 'get_public_key': {
-        if (!userId || !msg.targetId) return;
+        if (!myId || !msg.targetId) return;
         const info = publicUserInfo(msg.targetId);
-        if (info) send(ws, { type: 'public_key', id: info.id, publicKey: info.publicKey });
+        if (info && info.publicKey) send(ws, { type: 'public_key', id: info.id, publicKey: info.publicKey });
         break;
       }
 
       case 'message': {
-        if (!userId) return;
+        if (!myId) return;
         const { to, ciphertext, iv } = msg;
         if (!to || !ciphertext || !iv) return;
-        const self = clients.get(userId);
-        if (!self || !self.contacts.has(to)) {
+        const acc = store.accounts[myId];
+        if (!acc || !acc.contacts.includes(to)) {
           return send(ws, { type: 'error', message: 'bu kullanıcıya mesaj gönderme yetkiniz yok' });
         }
         const msgId = genId();
         const ts = Date.now();
-        const target = clients.get(to);
-        const packet = { type: 'message', id: msgId, from: userId, ciphertext, iv, ts };
+        const targetSession = sessions.get(to);
+        const packet = { type: 'message', id: msgId, from: myId, ciphertext, iv, ts };
 
-        if (target && target.ws.readyState === WebSocket.OPEN) {
-          send(target.ws, packet); // anında ilet
+        if (targetSession && targetSession.ws.readyState === WebSocket.OPEN) {
+          send(targetSession.ws, packet);
         } else {
           if (!offlineQueue.has(to)) offlineQueue.set(to, new Map());
-          offlineQueue.get(to).set(msgId, { from: userId, ciphertext, iv, ts }); // yalnızca RAM
+          offlineQueue.get(to).set(msgId, { from: myId, ciphertext, iv, ts });
         }
         send(ws, { type: 'message_sent', id: msgId, to });
         break;
       }
 
       case 'read_receipt': {
-        if (!userId) return;
+        if (!myId) return;
         const { messageId, from } = msg;
         if (!messageId || !from) return;
-
-        // Sunucu RAM'inden kalıcı olarak sil
-        const q = offlineQueue.get(userId);
+        const q = offlineQueue.get(myId);
         if (q) q.delete(messageId);
-
-        // Gönderene bildir: kendi ekranından/belleğinden de silsin
-        const sender = clients.get(from);
-        if (sender) send(sender.ws, { type: 'read_receipt', messageId, by: userId });
+        const senderSession = sessions.get(from);
+        if (senderSession) send(senderSession.ws, { type: 'read_receipt', messageId, by: myId });
         break;
       }
 
@@ -219,28 +248,29 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    if (!userId) return;
-    const c = clients.get(userId);
-    if (c) {
-      clearTimeout(c.inviteTimer);
-      if (c.inviteCode) inviteCodeIndex.delete(c.inviteCode);
-      broadcastPresence(userId, false);
-      clients.delete(userId); // kullanıcı verisi RAM'den tamamen kalkar
-    }
+    if (!myId) return;
+    sessions.delete(myId);
+    broadcastPresence(myId, false);
   });
-
   ws.on('error', () => { try { ws.close(); } catch (_) {} });
 });
 
-// Güvenlik supabı: hiç okunmadan çok uzun süre bekleyen çevrimdışı mesajları temizle
+// Kullanılmamış davet kodlarını temizle (hesapların kendisi ASLA silinmez)
 setInterval(() => {
-  const cutoff = Date.now() - OFFLINE_MSG_MAX_AGE_MS;
+  const cutoff = Date.now() - PENDING_INVITE_TTL_MS;
+  let changed = false;
+  for (const [code, inv] of Object.entries(store.pendingInvites)) {
+    if (inv.createdAt < cutoff) { delete store.pendingInvites[code]; changed = true; }
+  }
+  if (changed) saveStore();
+
+  const msgCutoff = Date.now() - OFFLINE_MSG_MAX_AGE_MS;
   for (const [uid, q] of offlineQueue) {
-    for (const [mid, m] of q) if (m.ts < cutoff) q.delete(mid);
+    for (const [mid, m] of q) if (m.ts < msgCutoff) q.delete(mid);
     if (q.size === 0) offlineQueue.delete(uid);
   }
 }, 60 * 60 * 1000);
 
 server.listen(PORT, () => {
-  console.log(`emesen relay sunucusu :${PORT} — yalnızca RAM, veritabanı yok, disk yazımı yok`);
+  console.log(`emesen relay sunucusu :${PORT} — kayıtlı hesap sayısı: ${Object.keys(store.accounts).length}`);
 });
