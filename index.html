@@ -562,13 +562,17 @@ function markVisibleAsRead(){
   const c = contacts.get(activeContactId);
   if (!c) return;
 
+  // SADECE henüz kilitlenmemiş (pendingRead: false) mesajları işleme alıyoruz!
   c.messages.filter(m => !m.mine && !m.readByMe && !m.pendingRead).forEach(m => {
-    m.pendingRead = true; // Tekrar tekrar tetiklenmesini engellemek için kilit koyuyoruz!
+    
+    m.pendingRead = true; // KİLİT: Bu mesaj için geri sayım başladı, tekrar tetikleme!
+
     setTimeout(() => {
       m.readByMe = true;
       wsSend({ type:'read_receipt', messageId: m.id, from: m.from });
       vanishMessage(activeContactId, m.id);
     }, READ_DELAY_MS);
+
   });
 }
 
