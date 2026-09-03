@@ -302,11 +302,12 @@ const DEFAULT_WS_URL = 'wss://emesen-relay.onrender.com';
 function getServerUrl(){ return localStorage.getItem('emesen_server_url') || DEFAULT_WS_URL; }
 function setServerUrl(u){ localStorage.setItem('emesen_server_url', u); }
 
-const READ_DELAY_MS = 600000;
-const VANISH_ANIM_MS = 1000;
+// MESAJIN OKUNDUKTAN SONRA SİLİNME SÜRESİ (10 saniye)
+const READ_DELAY_MS = 600000; 
+const VANISH_ANIM_MS = 420;
 
 /* =========================================================
-   STATE (mesajlar ve özel anahtar yalnızca bellekte)
+   STATE
    ========================================================= */
 let ws = null;
 let myId = null;
@@ -317,11 +318,11 @@ let reconnectTimer = null;
 let manualClose = false;
 let loginCode = null;
 
-const contacts = new Map(); // contactId -> {nickname, online, publicKeyJwk, aesKey, messages:[]}
+const contacts = new Map();
 let activeContactId = null;
 
 /* =========================================================
-   UI yardımcıları
+   UI YARDIMCILARI
    ========================================================= */
 const $ = (id) => document.getElementById(id);
 function toast(msg){
@@ -333,7 +334,7 @@ function fmtTime(ts){ const d=new Date(ts); return d.toLocaleTimeString('tr-TR',
 function escapeHtml(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
 
 /* =========================================================
-   KRİPTO: ECDH (P-256) + AES-256-GCM — özel anahtar hiç dışarı çıkmaz
+   KRİPTO: ECDH (P-256) + AES-256-GCM
    ========================================================= */
 async function generateMyKeyPair(){
   myKeyPair = await crypto.subtle.generateKey({ name:'ECDH', namedCurve:'P-256' }, true, ['deriveKey']);
@@ -418,14 +419,13 @@ async function handleServerMessage(msg){
     }
     case 'message': { await receiveMessage(msg); break; }
     case 'message_sent': break;
-    case 'read_receipt': { vanishMessage(msg.by, msg.messageId, true); break; }
+    case 'read_receipt': { vanishMessage(msg.by, msg.messageId); break; }
     case 'error': { handleLoginOrRuntimeError(msg.message); break; }
   }
 }
 
 function handleLoginOrRuntimeError(message){
   if (!myId){
-    // Henüz giriş tamamlanmadıysa bu, giriş ekranındaki bir hata
     $('authError').textContent = message || 'Bir hata oluştu';
     const btn = $('authSubmitBtn');
     btn.disabled = false; btn.textContent = "emesen'e gir";
@@ -475,7 +475,7 @@ function renderContactList(){
 }
 
 /* =========================================================
-   SOHBET AÇMA / MOBİL GEÇİŞ
+   SOHBET AÇMA
    ========================================================= */
 function openChat(id){
   activeContactId = id;
@@ -519,6 +519,7 @@ async function sendCurrentMessage(){
   }
   await actuallySend(activeContactId, aesKey, text);
 }
+
 async function flushPendingSend(contactId){
   const q = pendingOutgoing.get(contactId);
   if (!q || !q.length) return;
@@ -526,6 +527,7 @@ async function flushPendingSend(contactId){
   for (const text of q) await actuallySend(contactId, c.aesKey, text);
   pendingOutgoing.delete(contactId);
 }
+
 async function actuallySend(contactId, aesKey, text){
   const { ciphertext, iv } = await encryptText(aesKey, text);
   const localId = 'local-' + Math.random().toString(36).slice(2);
@@ -537,7 +539,7 @@ async function actuallySend(contactId, aesKey, text){
 }
 
 /* =========================================================
-   MESAJ ALMA + OKU-VE-YOKET
+   MESAJ ALMA + OKU-VE-YOKET (KİLİTLİ MEKANİZMA)
    ========================================================= */
 async function receiveMessage(msg){
   let c = contacts.get(msg.from);
@@ -549,7 +551,7 @@ async function receiveMessage(msg){
   try { text = await decryptText(aesKey, msg.ciphertext, msg.iv); }
   catch(e){ console.error('şifre çözme hatası', e); return; }
 
-  c.messages.push({ id: msg.id, mine:false, text, ts: msg.ts||Date.now(), readByMe:false, from: msg.from });
+  c.messages.push({ id: msg.id, mine:false, text, ts: msg.ts||Date.now(), readByMe:false, pendingRead:false, from: msg.from });
 
   if (msg.from === activeContactId){ renderMessages(); markVisibleAsRead(); }
   else { renderContactList(); toast(c.nickname + ' sana mesaj gönderdi'); }
@@ -559,14 +561,17 @@ function markVisibleAsRead(){
   if (!activeContactId || document.hidden) return;
   const c = contacts.get(activeContactId);
   if (!c) return;
-  c.messages.filter(m => !m.mine && !m.readByMe).forEach(m => {
-    m.readByMe = true;
+
+  c.messages.filter(m => !m.mine && !m.readByMe && !m.pendingRead).forEach(m => {
+    m.pendingRead = true; // Tekrar tekrar tetiklenmesini engellemek için kilit koyuyoruz!
     setTimeout(() => {
+      m.readByMe = true;
       wsSend({ type:'read_receipt', messageId: m.id, from: m.from });
-      vanishMessage(activeContactId, m.id, false);
+      vanishMessage(activeContactId, m.id);
     }, READ_DELAY_MS);
   });
 }
+
 function vanishMessage(contactId, messageId){
   const c = contacts.get(contactId);
   if (!c) return;
@@ -605,9 +610,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) mark
 /* =========================================================
    DAVET KODU ÜRETME
    ========================================================= */
-$('genInviteBtn').addEventListener('click', () => {
-  wsSend({ type:'generate_invite' });
-});
+$('genInviteBtn').addEventListener('click', () => { wsSend({ type:'generate_invite' }); });
 $('copyInviteBtn').addEventListener('click', () => {
   const code = $('inviteCodeText').textContent;
   if (!/^\d{6}$/.test(code)) return toast('Önce bir kod üret');
@@ -644,7 +647,7 @@ $('serverSettingsBtn').addEventListener('click', promptServerUrl);
 $('serverSettingsBtn2').addEventListener('click', promptServerUrl);
 
 /* =========================================================
-   GİRİŞ AKIŞI — yalnızca davet kodu ile
+   GİRİŞ AKIŞI
    ========================================================= */
 $('codeInput').addEventListener('input', (e) => {
   e.target.value = e.target.value.replace(/\D/g,'').slice(0,6);
@@ -686,9 +689,6 @@ $('authForm').addEventListener('submit', async (e) => {
     btn.disabled = false; btn.textContent = "emesen'e gir";
   }
 });
-
-// Mesaj içerikleri ve özel anahtar hiçbir zaman diske yazılmaz — sekme kapanınca bellekle yok olur.
-// Hesap kimliği (kod/nickname/kişi listesi) sunucu tarafında kalıcıdır.
 })();
 </script>
 </body>
